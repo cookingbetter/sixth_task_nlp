@@ -11,8 +11,15 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from llm_client import LLMClient, LLMClientError
-from prompts import DEFAULT_VARIANT_NAME, VARIANTS, PromptVariant, get_variant
-from schemas import Category, Sentiment, TextProcessingResult
+from prompts import (
+    DEFAULT_VARIANT_NAME,
+    VARIANTS,
+    PromptVariant,
+    build_answer_user,
+    get_route,
+    get_variant,
+)
+from schemas import Category, Classification, FinalAnswer, Sentiment, TextProcessingResult
 
 EXAMPLES_PATH = Path("examples/sample_inputs.json")
 DEFAULT_OUTPUT = Path("output/results.json")
@@ -20,11 +27,11 @@ DEFAULT_OUTPUT = Path("output/results.json")
 logger = logging.getLogger("pipeline")
 
 CATEGORY_LABELS = {
-    Category.question: "Ответ на вопрос",
-    Category.information: "Краткий итог",
-    Category.advice: "Рекомендация",
-    Category.bug: "Что сделать с ошибкой",
-    Category.other: "Итог",
+    Category.support: "Техническая помощь",
+    Category.feedback: "Ответ на отзыв",
+    Category.complaint: "Ответ на жалобу",
+    Category.sales: "Предложение",
+    Category.general_question: "Ответ на вопрос",
 }
 SENTIMENT_PREFIX = {
     Sentiment.negative: "Сначала разберите проблему. ",
@@ -82,16 +89,9 @@ def strip_json_fences(raw: str) -> str:
     return "\n".join(lines).strip()
 
 
-def parse_model_payload(raw: str) -> TextProcessingResult:
-    """Parse model text and validate it against the result schema."""
-    payload = json.loads(strip_json_fences(raw))
-    result = TextProcessingResult.model_validate(payload)
-    logger.info(
-        "validation ok category=%s sentiment=%s",
-        result.category.value,
-        result.sentiment.value,
-    )
-    return result
+def parse_json_object(raw: str) -> object:
+    """Parse model text as JSON, dropping a markdown fence when present."""
+    return json.loads(strip_json_fences(raw))
 
 
 def process_text(
@@ -99,12 +99,46 @@ def process_text(
     text: str,
     variant: PromptVariant | None = None,
 ) -> TextProcessingResult:
-    """Call the model and return a validated processing result."""
+    """Classify the text, then generate an answer with the category route."""
     selected = variant or get_variant()
     logger.info("processing text length=%s prompt=%s", len(text), selected.name)
     raw = client.complete(selected.system, selected.build_user(text))
-    logger.info("model response received chars=%s", len(raw))
-    return parse_model_payload(raw)
+    logger.info("classification response received chars=%s", len(raw))
+    classification = Classification.model_validate(parse_json_object(raw))
+    route = get_route(classification.category.value)
+    logger.info(
+        "route selected route=%s intent=%s",
+        route.name,
+        classification.intent,
+    )
+
+    answer_raw = client.complete(
+        route.system,
+        build_answer_user(
+            text,
+            classification.summary,
+            classification.intent,
+            classification.key_points,
+            classification.category.value,
+        ),
+    )
+    logger.info("answer response received chars=%s", len(answer_raw))
+    answer = FinalAnswer.model_validate(parse_json_object(answer_raw))
+    result = TextProcessingResult(
+        summary=classification.summary,
+        category=classification.category,
+        sentiment=classification.sentiment,
+        intent=classification.intent,
+        key_points=classification.key_points,
+        final_answer=answer.final_answer,
+    )
+    logger.info(
+        "validation ok category=%s sentiment=%s route=%s",
+        result.category.value,
+        result.sentiment.value,
+        route.name,
+    )
+    return result
 
 
 def load_examples(path: Path) -> list[dict[str, str]]:
@@ -121,7 +155,11 @@ def load_examples(path: Path) -> list[dict[str, str]]:
         if not text:
             raise ValueError(f"Example {index} has an empty text.")
         item_id = str(item.get("id") or f"example-{index}")
-        examples.append({"id": item_id, "text": text})
+        example = {"id": item_id, "text": text}
+        expected = str(item.get("expected_category") or "").strip()
+        if expected:
+            example["expected_category"] = expected
+        examples.append(example)
     return examples
 
 
@@ -142,6 +180,8 @@ def run_items(
 
     for item in items:
         record = {"id": item["id"], "text": item["text"], "prompt": selected.name}
+        if item.get("expected_category"):
+            record["expected_category"] = item["expected_category"]
         try:
             result = process_text(client, item["text"], selected)
         except (LLMClientError, ValidationError, ValueError) as exc:
@@ -156,6 +196,7 @@ def run_items(
             record["error"] = message
         else:
             record.update(result.model_dump(mode="json"))
+            record["route"] = result.category.value
             record["delivery"] = build_delivery(result)
         results.append(record)
 
@@ -176,6 +217,8 @@ def print_results(results: list[dict]) -> None:
         else:
             print(f"Summary: {record['summary']}")
             print(f"Категория: {record['category']}")
+            print(f"Маршрут: {record['route']}")
+            print(f"Intent: {record['intent']}")
             print(f"Тональность: {record['sentiment']}")
             print("Ключевые мысли:")
             for index, point in enumerate(record["key_points"], start=1):
@@ -191,6 +234,26 @@ def save_results(path: Path, results: list[dict]) -> None:
         encoding="utf-8",
     )
     logger.info("results saved path=%s", path)
+
+
+def report_categories(results: list[dict]) -> int:
+    """Print how many predicted categories match the examples. Return 1 below 8 matches."""
+    expected = [record for record in results if record.get("expected_category")]
+    if not expected:
+        return 0
+    matched = [
+        record
+        for record in expected
+        if record.get("category") == record["expected_category"]
+    ]
+    print(f"Категории совпали: {len(matched)} из {len(expected)}")
+    for record in expected:
+        if record.get("category") != record["expected_category"]:
+            got = record.get("category", "ошибка")
+            print(
+                f"- {record['id']}: ожидали {record['expected_category']}, получили {got}"
+            )
+    return 1 if len(matched) < 8 else 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -240,8 +303,11 @@ def main() -> int:
 
     results = run_items(client, items, get_variant(args.prompt))
     print_results(results)
+    category_code = report_categories(results)
     save_results(args.output, results)
-    return 1 if any("error" in record for record in results) else 0
+    if any("error" in record for record in results) or category_code:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Day-1 pipeline: one text in, summary, key points, and a short response out."""
+"""Pipeline: one text in, summary, key points, and a short response out."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from llm_client import LLMClient, LLMClientError
-from prompts import SYSTEM_PROMPT, build_user_prompt
+from prompts import DEFAULT_VARIANT_NAME, VARIANTS, PromptVariant, get_variant
 from schemas import TextProcessingResult
 
 EXAMPLES_PATH = Path("examples/sample_inputs.json")
@@ -34,10 +34,15 @@ def strip_json_fences(raw: str) -> str:
     return "\n".join(lines).strip()
 
 
-def process_text(client: LLMClient, text: str) -> TextProcessingResult:
+def process_text(
+    client: LLMClient,
+    text: str,
+    variant: PromptVariant | None = None,
+) -> TextProcessingResult:
     """Call the model and return a validated processing result."""
-    logger.info("processing text length=%s", len(text))
-    raw = client.complete(SYSTEM_PROMPT, build_user_prompt(text))
+    selected = variant or get_variant()
+    logger.info("processing text length=%s prompt=%s", len(text), selected.name)
+    raw = client.complete(selected.system, selected.build_user(text))
     logger.info("model response received chars=%s", len(raw))
 
     try:
@@ -68,19 +73,30 @@ def load_examples(path: Path) -> list[dict[str, str]]:
     return examples
 
 
-def run_items(client: LLMClient, items: list[dict[str, str]]) -> list[dict]:
+def run_items(
+    client: LLMClient,
+    items: list[dict[str, str]],
+    variant: PromptVariant | None = None,
+) -> list[dict]:
     """Process every item. A failure on one text does not stop the rest."""
-    logger.info("run started count=%s model=%s", len(items), client.model)
+    selected = variant or get_variant()
+    logger.info(
+        "run started count=%s model=%s prompt=%s",
+        len(items),
+        client.model,
+        selected.name,
+    )
     results: list[dict] = []
 
     for item in items:
-        record = {"id": item["id"], "text": item["text"]}
+        record = {"id": item["id"], "text": item["text"], "prompt": selected.name}
         try:
-            result = process_text(client, item["text"])
+            result = process_text(client, item["text"], selected)
         except (LLMClientError, ValidationError, ValueError) as exc:
             logger.error(
-                "text failed id=%s error=%s: %s",
+                "text failed id=%s prompt=%s error=%s: %s",
                 item["id"],
+                selected.name,
                 type(exc).__name__,
                 exc,
             )
@@ -97,7 +113,8 @@ def run_items(client: LLMClient, items: list[dict[str, str]]) -> list[dict]:
 def print_results(results: list[dict]) -> None:
     """Print a readable block for each processed text."""
     for record in results:
-        print(f"=== {record['id']} ===")
+        prompt_name = record.get("prompt", DEFAULT_VARIANT_NAME)
+        print(f"=== {record['id']} ({prompt_name}) ===")
         print(record["text"])
         print()
         if "error" in record:
@@ -125,6 +142,12 @@ def parse_args() -> argparse.Namespace:
         description="Сжать текст в summary, три ключевые мысли и короткий ответ.",
     )
     parser.add_argument("--text", help="Обработать один произвольный текст.")
+    parser.add_argument(
+        "--prompt",
+        choices=tuple(VARIANTS),
+        default=DEFAULT_VARIANT_NAME,
+        help=f"Формулировка промпта (по умолчанию {DEFAULT_VARIANT_NAME}).",
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -159,7 +182,7 @@ def main() -> int:
             logger.error("examples failed error=%s: %s", type(exc).__name__, exc)
             return 1
 
-    results = run_items(client, items)
+    results = run_items(client, items, get_variant(args.prompt))
     print_results(results)
     save_results(args.output, results)
     return 1 if any("error" in record for record in results) else 0

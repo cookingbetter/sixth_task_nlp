@@ -13,13 +13,27 @@ from pydantic import ValidationError
 from llm_client import LLMClient, LLMClientError
 from prompts import (
     DEFAULT_VARIANT_NAME,
+    EXTRACT_SYSTEM,
+    SELF_CHECK_SYSTEM,
     VARIANTS,
     PromptVariant,
     build_answer_user,
+    build_classify_user,
+    build_extract_user,
+    build_self_check_user,
     get_route,
     get_variant,
 )
-from schemas import Category, Classification, FinalAnswer, Sentiment, TextProcessingResult
+from schemas import (
+    Category,
+    FinalAnswer,
+    MeaningExtract,
+    RequestClassification,
+    SelfCheck,
+    Sentiment,
+    StructuredFields,
+    TextProcessingResult,
+)
 
 EXAMPLES_PATH = Path("examples/sample_inputs.json")
 DEFAULT_OUTPUT = Path("output/results.json")
@@ -94,49 +108,147 @@ def parse_json_object(raw: str) -> object:
     return json.loads(strip_json_fences(raw))
 
 
+def extract_meaning(client: LLMClient, text: str) -> MeaningExtract:
+    """Step 1. Sees only the raw text."""
+    logger.info("step=extract_meaning start chars=%s", len(text))
+    raw = client.complete(EXTRACT_SYSTEM, build_extract_user(text))
+    extracted = MeaningExtract.model_validate(parse_json_object(raw))
+    logger.info(
+        "step=extract_meaning done meaning_chars=%s points=%s",
+        len(extracted.meaning),
+        len(extracted.key_points),
+    )
+    return extracted
+
+
+def classify_request(
+    client: LLMClient,
+    text: str,
+    extracted: MeaningExtract,
+    variant: PromptVariant,
+) -> RequestClassification:
+    """Step 2. Sees the extracted meaning and key points."""
+    logger.info("step=classify start prompt=%s", variant.name)
+    raw = client.complete(
+        variant.system,
+        build_classify_user(text, extracted.meaning, extracted.key_points, variant),
+    )
+    classification = RequestClassification.model_validate(parse_json_object(raw))
+    logger.info(
+        "step=classify done category=%s sentiment=%s intent=%s",
+        classification.category.value,
+        classification.sentiment.value,
+        classification.intent,
+    )
+    return classification
+
+
+def build_structured_fields(
+    extracted: MeaningExtract,
+    classification: RequestClassification,
+) -> StructuredFields:
+    """Step 3. Assembles one object from the two previous steps. No model call."""
+    fields = StructuredFields(
+        summary=extracted.meaning,
+        key_points=extracted.key_points,
+        category=classification.category,
+        sentiment=classification.sentiment,
+        intent=classification.intent,
+    )
+    logger.info(
+        "step=structured_fields category=%s sentiment=%s points=%s",
+        fields.category.value,
+        fields.sentiment.value,
+        len(fields.key_points),
+    )
+    return fields
+
+
+def generate_final_answer(
+    client: LLMClient,
+    text: str,
+    fields: StructuredFields,
+) -> str:
+    """Step 4. The route and the answer both come from the structured fields."""
+    route = get_route(fields.category.value)
+    logger.info("step=final_answer start route=%s", route.name)
+    raw = client.complete(
+        route.system,
+        build_answer_user(
+            text,
+            fields.summary,
+            fields.intent,
+            fields.key_points,
+            fields.category.value,
+        ),
+    )
+    answer = FinalAnswer.model_validate(parse_json_object(raw))
+    logger.info(
+        "step=final_answer done route=%s chars=%s",
+        route.name,
+        len(answer.final_answer),
+    )
+    return answer.final_answer
+
+
+def self_check_result(
+    client: LLMClient,
+    text: str,
+    fields: StructuredFields,
+    final_answer: str,
+) -> SelfCheck:
+    """Step 5. Checks the answer against the original text and earlier fields."""
+    logger.info("step=self_check start")
+    raw = client.complete(
+        SELF_CHECK_SYSTEM,
+        build_self_check_user(
+            text,
+            fields.summary,
+            fields.key_points,
+            fields.category.value,
+            fields.intent,
+            final_answer,
+        ),
+    )
+    check = SelfCheck.model_validate(parse_json_object(raw))
+    logger.info(
+        "step=self_check done consistent=%s details_kept=%s",
+        check.consistent,
+        check.details_kept,
+    )
+    return check
+
+
 def process_text(
     client: LLMClient,
     text: str,
     variant: PromptVariant | None = None,
 ) -> TextProcessingResult:
-    """Classify the text, then generate an answer with the category route."""
+    """Run extract, classify, structured fields, routed answer, and self-check."""
     selected = variant or get_variant()
-    logger.info("processing text length=%s prompt=%s", len(text), selected.name)
-    raw = client.complete(selected.system, selected.build_user(text))
-    logger.info("classification response received chars=%s", len(raw))
-    classification = Classification.model_validate(parse_json_object(raw))
-    route = get_route(classification.category.value)
-    logger.info(
-        "route selected route=%s intent=%s",
-        route.name,
-        classification.intent,
-    )
-
-    answer_raw = client.complete(
-        route.system,
-        build_answer_user(
-            text,
-            classification.summary,
-            classification.intent,
-            classification.key_points,
-            classification.category.value,
-        ),
-    )
-    logger.info("answer response received chars=%s", len(answer_raw))
-    answer = FinalAnswer.model_validate(parse_json_object(answer_raw))
+    logger.info("chain start length=%s prompt=%s", len(text), selected.name)
+    extracted = extract_meaning(client, text)
+    classification = classify_request(client, text, extracted, selected)
+    fields = build_structured_fields(extracted, classification)
+    final_answer = generate_final_answer(client, text, fields)
+    check = self_check_result(client, text, fields, final_answer)
     result = TextProcessingResult(
-        summary=classification.summary,
-        category=classification.category,
-        sentiment=classification.sentiment,
-        intent=classification.intent,
-        key_points=classification.key_points,
-        final_answer=answer.final_answer,
+        summary=fields.summary,
+        key_points=fields.key_points,
+        category=fields.category,
+        sentiment=fields.sentiment,
+        intent=fields.intent,
+        final_answer=final_answer,
+        consistent=check.consistent,
+        details_kept=check.details_kept,
+        check_notes=check.notes,
     )
     logger.info(
-        "validation ok category=%s sentiment=%s route=%s",
+        "chain done category=%s route=%s consistent=%s details_kept=%s",
         result.category.value,
-        result.sentiment.value,
-        route.name,
+        result.category.value,
+        result.consistent,
+        result.details_kept,
     )
     return result
 
@@ -215,14 +327,23 @@ def print_results(results: list[dict]) -> None:
         if "error" in record:
             print(f"Ошибка: {record['error']}")
         else:
-            print(f"Summary: {record['summary']}")
-            print(f"Категория: {record['category']}")
-            print(f"Маршрут: {record['route']}")
-            print(f"Intent: {record['intent']}")
-            print(f"Тональность: {record['sentiment']}")
-            print("Ключевые мысли:")
-            for index, point in enumerate(record["key_points"], start=1):
-                print(f"{index}. {point}")
+            print("Шаги:")
+            print(f"1. extract_meaning: {record['summary']}")
+            print(
+                "2. classify: "
+                f"category={record['category']} "
+                f"sentiment={record['sentiment']} "
+                f"intent={record['intent']}"
+            )
+            points = "; ".join(record["key_points"])
+            print(f"3. structured_fields: {points}")
+            print(f"4. final_answer route={record['route']}: {record['final_answer']}")
+            print(
+                "5. self_check: "
+                f"consistent={record['consistent']} "
+                f"details_kept={record['details_kept']} "
+                f"notes={record['check_notes']}"
+            )
             print(record["delivery"])
         print()
 

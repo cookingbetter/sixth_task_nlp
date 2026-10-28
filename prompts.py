@@ -8,6 +8,7 @@ MAX_KEY_POINT_CHARS = 120
 MAX_FINAL_ANSWER_CHARS = 200
 MAX_SALES_ANSWER_CHARS = 160
 MAX_INTENT_CHARS = 120
+MAX_CHECK_NOTES_CHARS = 200
 KEY_POINT_COUNT = 3
 
 DEFAULT_VARIANT_NAME = "plain"
@@ -20,13 +21,11 @@ ROUTE_ANSWER_LIMITS = {
     "general_question": MAX_FINAL_ANSWER_CHARS,
 }
 
-_JSON_SHAPE = """\
+_CLASSIFY_SHAPE = """\
 {
-  "summary": "краткое содержание",
   "category": "support | feedback | complaint | sales | general_question",
   "sentiment": "positive | neutral | negative",
-  "intent": "чего хочет автор текста",
-  "key_points": ["мысль 1", "мысль 2", "мысль 3"]
+  "intent": "чего хочет автор текста"
 }"""
 
 _CATEGORY_RULES = """\
@@ -64,19 +63,15 @@ def _plain_user(text: str) -> str:
 
 def _checklist_user(text: str) -> str:
     return (
-        "Ограничения:\n"
-        f"- summary не длиннее {MAX_SUMMARY_CHARS} символов\n"
-        f"- key_points: ровно {KEY_POINT_COUNT} пункта, каждый не длиннее {MAX_KEY_POINT_CHARS} символов\n"
+        "Ограничения классификации:\n"
         f"- intent не длиннее {MAX_INTENT_CHARS} символов\n"
+        "- category и sentiment только из списка в system prompt\n"
         f"Текст:\n{text.strip()}"
     )
 
 
 def _limits_block() -> str:
     return (
-        f"- summary не длиннее {MAX_SUMMARY_CHARS} символов\n"
-        f"- key_points содержит ровно {KEY_POINT_COUNT} непустые строки, "
-        f"каждая не длиннее {MAX_KEY_POINT_CHARS} символов\n"
         f"- intent не длиннее {MAX_INTENT_CHARS} символов\n"
         f"{_CATEGORY_RULES}"
     )
@@ -102,15 +97,14 @@ VARIANTS: dict[str, PromptVariant] = {
     "plain": PromptVariant(
         name="plain",
         system=f"""\
-Ты классифицируешь пользовательский текст и возвращаешь только JSON-объект.
+Ты классифицируешь уже извлечённый смысл и возвращаешь только JSON-объект.
 Не пиши итоговый ответ и не оборачивай JSON в markdown.
+Опирайся на извлечённый смысл и ключевые мысли, а не пересказывай текст заново.
 
 Схема:
-{_JSON_SHAPE}
+{_CLASSIFY_SHAPE}
 
 Правила:
-- key_points содержит ровно {KEY_POINT_COUNT} непустые строки
-- summary — краткое содержание в 1-2 предложениях
 {_CATEGORY_RULES}
 - пиши на том же языке, что и входной текст
 - не добавляй другие поля
@@ -120,11 +114,12 @@ VARIANTS: dict[str, PromptVariant] = {
     "limits": PromptVariant(
         name="limits",
         system=f"""\
-Ты классифицируешь пользовательский текст и возвращаешь только JSON-объект.
+Ты классифицируешь уже извлечённый смысл и возвращаешь только JSON-объект.
 Не пиши итоговый ответ и не оборачивай JSON в markdown.
+Опирайся на извлечённый смысл и ключевые мысли, а не пересказывай текст заново.
 
 Схема:
-{_JSON_SHAPE}
+{_CLASSIFY_SHAPE}
 
 Правила:
 {_limits_block()}
@@ -142,10 +137,10 @@ VARIANTS: dict[str, PromptVariant] = {
 Перед ответом проверь чеклист:
 {_limits_block()}
 - язык ответа совпадает с языком входного текста
-- в JSON только поля summary, category, sentiment, intent и key_points
+- в JSON только поля category, sentiment и intent
 
 Схема:
-{_JSON_SHAPE}
+{_CLASSIFY_SHAPE}
 """,
         build_user=_checklist_user,
     ),
@@ -211,6 +206,84 @@ def get_route(category: str) -> AnswerRoute:
         return ROUTES[category]
     except KeyError as exc:
         raise ValueError(f"Нет маршрута для категории {category}") from exc
+
+
+EXTRACT_SYSTEM = f"""\
+Ты извлекаешь смысл текста и возвращаешь только JSON-объект.
+Не классифицируй запрос и не пиши ответ пользователю.
+
+Схема:
+{{
+  "meaning": "что сказано в тексте, 1-2 предложения",
+  "key_points": ["мысль 1", "мысль 2", "мысль 3"]
+}}
+
+Правила:
+- meaning не длиннее {MAX_SUMMARY_CHARS} символов
+- key_points содержит ровно {KEY_POINT_COUNT} непустые строки, каждая не длиннее {MAX_KEY_POINT_CHARS} символов
+- сохрани имена, числа и конкретную просьбу, если они есть
+- пиши на том же языке, что и входной текст
+- не добавляй другие поля
+"""
+
+SELF_CHECK_SYSTEM = f"""\
+Ты проверяешь готовый ответ и возвращаешь только JSON-объект.
+Не переписывай ответ.
+
+Схема:
+{{
+  "consistent": true,
+  "details_kept": true,
+  "notes": "одно короткое предложение"
+}}
+
+Правила:
+- consistent равен false, если ответ противоречит исходному тексту или смыслу
+- details_kept равен false, если из ответа пропала важная деталь: число, имя, конкретная просьба или факт
+- notes не длиннее {MAX_CHECK_NOTES_CHARS} символов
+- consistent и details_kept только булевы true или false
+- не добавляй другие поля
+"""
+
+
+def build_extract_user(text: str) -> str:
+    """User message for the meaning step. It sees only the raw text."""
+    return f"Текст:\n{text.strip()}"
+
+
+def build_classify_user(
+    text: str,
+    meaning: str,
+    key_points: list[str],
+    variant: PromptVariant,
+) -> str:
+    """User message for classification. It sees the extracted meaning first."""
+    points = "\n".join(f"- {point}" for point in key_points)
+    return (
+        f"Извлечённый смысл:\n{meaning}\n"
+        f"Ключевые мысли:\n{points}\n"
+        f"{variant.build_user(text)}"
+    )
+
+
+def build_self_check_user(
+    text: str,
+    summary: str,
+    key_points: list[str],
+    category: str,
+    intent: str,
+    final_answer: str,
+) -> str:
+    """User message for the check step. It sees the text, fields, and answer."""
+    points = "\n".join(f"- {point}" for point in key_points)
+    return (
+        f"Исходный текст:\n{text.strip()}\n"
+        f"Смысл:\n{summary}\n"
+        f"Категория: {category}\n"
+        f"Intent: {intent}\n"
+        f"Ключевые мысли:\n{points}\n"
+        f"Ответ:\n{final_answer}"
+    )
 
 
 def build_answer_user(

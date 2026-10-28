@@ -1,4 +1,4 @@
-"""Structured result of the text processing step."""
+"""Structured results of the multi-step text pipeline."""
 
 from enum import Enum
 from typing import Annotated
@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from prompts import (
     KEY_POINT_COUNT,
+    MAX_CHECK_NOTES_CHARS,
     MAX_FINAL_ANSWER_CHARS,
     MAX_INTENT_CHARS,
     MAX_KEY_POINT_CHARS,
@@ -32,34 +33,28 @@ class Sentiment(str, Enum):
 KeyPoint = Annotated[str, Field(min_length=1, max_length=MAX_KEY_POINT_CHARS)]
 
 
-class Classification(BaseModel):
-    """Category, intent, and a short reading of the text. No final answer yet."""
+def _strip_text(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    return value.strip()
 
-    summary: str = Field(min_length=1, max_length=MAX_SUMMARY_CHARS)
-    category: Category
-    sentiment: Sentiment
-    intent: str = Field(min_length=1, max_length=MAX_INTENT_CHARS)
+
+class MeaningExtract(BaseModel):
+    """Step 1: what the text says, before any category is chosen."""
+
+    meaning: str = Field(min_length=1, max_length=MAX_SUMMARY_CHARS)
     key_points: list[KeyPoint] = Field(
         min_length=KEY_POINT_COUNT,
         max_length=KEY_POINT_COUNT,
     )
 
-    @field_validator("summary", "intent", mode="before")
+    @field_validator("meaning", mode="before")
     @classmethod
-    def strip_required_text(cls, value: object) -> object:
-        if not isinstance(value, str):
-            return value
-        cleaned = value.strip()
-        if not cleaned:
+    def strip_meaning(cls, value: object) -> object:
+        cleaned = _strip_text(value)
+        if isinstance(cleaned, str) and not cleaned:
             raise ValueError("must not be blank")
         return cleaned
-
-    @field_validator("category", "sentiment", mode="before")
-    @classmethod
-    def strip_label(cls, value: object) -> object:
-        if isinstance(value, str):
-            return value.strip().lower()
-        return value
 
     @field_validator("key_points", mode="before")
     @classmethod
@@ -78,36 +73,85 @@ class Classification(BaseModel):
         return cleaned
 
 
+class RequestClassification(BaseModel):
+    """Step 2: category and intent, using the extracted meaning."""
+
+    category: Category
+    sentiment: Sentiment
+    intent: str = Field(min_length=1, max_length=MAX_INTENT_CHARS)
+
+    @field_validator("intent", mode="before")
+    @classmethod
+    def strip_intent(cls, value: object) -> object:
+        cleaned = _strip_text(value)
+        if isinstance(cleaned, str) and not cleaned:
+            raise ValueError("must not be blank")
+        return cleaned
+
+    @field_validator("category", "sentiment", mode="before")
+    @classmethod
+    def strip_label(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+
+class StructuredFields(BaseModel):
+    """Step 3: one object assembled from meaning and classification."""
+
+    summary: str = Field(min_length=1, max_length=MAX_SUMMARY_CHARS)
+    key_points: list[KeyPoint] = Field(
+        min_length=KEY_POINT_COUNT,
+        max_length=KEY_POINT_COUNT,
+    )
+    category: Category
+    sentiment: Sentiment
+    intent: str = Field(min_length=1, max_length=MAX_INTENT_CHARS)
+
+
 class FinalAnswer(BaseModel):
-    """Answer produced by the category route."""
+    """Step 4: answer produced by the category route."""
 
     final_answer: str = Field(min_length=1, max_length=MAX_FINAL_ANSWER_CHARS)
 
     @field_validator("final_answer", mode="before")
     @classmethod
     def strip_final_answer(cls, value: object) -> object:
-        if not isinstance(value, str):
-            return value
-        cleaned = value.strip()
-        if not cleaned:
+        cleaned = _strip_text(value)
+        if isinstance(cleaned, str) and not cleaned:
             raise ValueError("must not be blank")
         return cleaned
 
 
-class TextProcessingResult(Classification):
-    """Classification plus the routed final answer."""
+class SelfCheck(BaseModel):
+    """Step 5: whether the answer fits the original text."""
+
+    consistent: bool
+    details_kept: bool
+    notes: str = Field(default="", max_length=MAX_CHECK_NOTES_CHARS)
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def strip_notes(cls, value: object) -> object:
+        if value is None:
+            return ""
+        return _strip_text(value)
+
+
+class TextProcessingResult(StructuredFields):
+    """Full chain result: structured fields, routed answer, and self-check."""
 
     final_answer: str = Field(min_length=1, max_length=MAX_FINAL_ANSWER_CHARS)
+    consistent: bool
+    details_kept: bool
+    check_notes: str = Field(default="", max_length=MAX_CHECK_NOTES_CHARS)
 
-    @field_validator("final_answer", mode="before")
+    @field_validator("final_answer", "check_notes", mode="before")
     @classmethod
-    def strip_final_answer(cls, value: object) -> object:
-        if not isinstance(value, str):
-            return value
-        cleaned = value.strip()
-        if not cleaned:
-            raise ValueError("must not be blank")
-        return cleaned
+    def strip_result_text(cls, value: object) -> object:
+        if value is None:
+            return ""
+        return _strip_text(value)
 
     @model_validator(mode="after")
     def enforce_route_limit(self) -> "TextProcessingResult":

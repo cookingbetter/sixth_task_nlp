@@ -28,6 +28,26 @@ _CLASSIFY_SHAPE = """\
   "intent": "чего хочет автор текста"
 }"""
 
+CLASSIFY_SCHEMA = _CLASSIFY_SHAPE
+
+EXTRACT_SCHEMA = """\
+{
+  "meaning": "что сказано в тексте, 1-2 предложения",
+  "key_points": ["мысль 1", "мысль 2", "мысль 3"]
+}"""
+
+ANSWER_SCHEMA = """\
+{"final_answer": "ответ пользователю"}"""
+
+SELF_CHECK_SCHEMA = """\
+{
+  "consistent": true,
+  "details_kept": true,
+  "notes": "одно короткое предложение"
+}"""
+
+MAX_REPAIR_CHARS = 500
+
 _CATEGORY_RULES = """\
 - category только одно из значений:
   support — сбой, ошибка, как починить или где нажать
@@ -83,7 +103,7 @@ def _answer_system(instruction: str, max_chars: int) -> str:
 Не добавляй пояснения и не оборачивай ответ в markdown.
 
 Схема:
-{{"final_answer": "ответ пользователю"}}
+{ANSWER_SCHEMA}
 
 Инструкция:
 {instruction}
@@ -213,10 +233,7 @@ EXTRACT_SYSTEM = f"""\
 Не классифицируй запрос и не пиши ответ пользователю.
 
 Схема:
-{{
-  "meaning": "что сказано в тексте, 1-2 предложения",
-  "key_points": ["мысль 1", "мысль 2", "мысль 3"]
-}}
+{EXTRACT_SCHEMA}
 
 Правила:
 - meaning не длиннее {MAX_SUMMARY_CHARS} символов
@@ -231,11 +248,7 @@ SELF_CHECK_SYSTEM = f"""\
 Не переписывай ответ.
 
 Схема:
-{{
-  "consistent": true,
-  "details_kept": true,
-  "notes": "одно короткое предложение"
-}}
+{SELF_CHECK_SCHEMA}
 
 Правила:
 - consistent равен false, если ответ противоречит исходному тексту или смыслу
@@ -244,6 +257,24 @@ SELF_CHECK_SYSTEM = f"""\
 - consistent и details_kept только булевы true или false
 - не добавляй другие поля
 """
+
+FALLBACK_SYSTEM = """\
+Предыдущий ответ не прошёл проверку. Верни только один JSON-объект по схеме из сообщения пользователя.
+Без markdown, без пояснений и без других полей.
+Если строка длиннее лимита, сократи её.
+"""
+
+
+def build_repair_user(schema: str, reason: str, raw: str) -> str:
+    """Ask for one schema-valid JSON object instead of the rejected answer."""
+    bad = raw.strip()
+    if len(bad) > MAX_REPAIR_CHARS:
+        bad = bad[:MAX_REPAIR_CHARS].rstrip()
+    return (
+        f"Схема:\n{schema.strip()}\n"
+        f"Почему ответ отклонён: {reason.strip()}\n"
+        f"Плохой ответ:\n{bad}"
+    )
 
 
 def build_extract_user(text: str) -> str:

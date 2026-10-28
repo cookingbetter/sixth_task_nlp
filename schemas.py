@@ -145,6 +145,7 @@ class TextProcessingResult(StructuredFields):
     consistent: bool
     details_kept: bool
     check_notes: str = Field(default="", max_length=MAX_CHECK_NOTES_CHARS)
+    warnings: list[str] = Field(default_factory=list)
 
     @field_validator("final_answer", "check_notes", mode="before")
     @classmethod

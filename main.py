@@ -1,25 +1,37 @@
-"""Pipeline: one text in, summary, key points, and a short response out."""
+"""CLI for the text pipeline: meaning, category, routed answer, and a self-check."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+from collections.abc import Callable
 from json import JSONDecodeError
 from pathlib import Path
+from typing import TypeVar
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
-from llm_client import LLMClient, LLMClientError
+from llm_client import EmptyModelResponseError, LLMClient, LLMClientError
 from prompts import (
+    ANSWER_SCHEMA,
+    CLASSIFY_SCHEMA,
     DEFAULT_VARIANT_NAME,
+    EXTRACT_SCHEMA,
     EXTRACT_SYSTEM,
+    FALLBACK_SYSTEM,
+    MAX_CHECK_NOTES_CHARS,
+    MAX_INTENT_CHARS,
+    MAX_KEY_POINT_CHARS,
+    MAX_SUMMARY_CHARS,
+    SELF_CHECK_SCHEMA,
     SELF_CHECK_SYSTEM,
     VARIANTS,
     PromptVariant,
     build_answer_user,
     build_classify_user,
     build_extract_user,
+    build_repair_user,
     build_self_check_user,
     get_route,
     get_variant,
@@ -39,6 +51,8 @@ EXAMPLES_PATH = Path("examples/sample_inputs.json")
 DEFAULT_OUTPUT = Path("output/results.json")
 
 logger = logging.getLogger("pipeline")
+
+M = TypeVar("M", bound=BaseModel)
 
 CATEGORY_LABELS = {
     Category.support: "Техническая помощь",
@@ -69,6 +83,8 @@ def build_delivery(result: TextProcessingResult) -> str:
 
 def explain_failure(exc: Exception) -> str:
     """Turn a parse or schema error into one short message."""
+    if isinstance(exc, EmptyModelResponseError):
+        return "Модель вернула пустой ответ."
     if isinstance(exc, ValidationError):
         parts: list[str] = []
         for err in exc.errors():
@@ -76,6 +92,12 @@ def explain_failure(exc: Exception) -> str:
             err_type = err["type"]
             if err_type == "missing":
                 parts.append(f"нет поля {loc}")
+            elif err_type == "string_too_long":
+                limit = err.get("ctx", {}).get("max_length")
+                if isinstance(limit, int):
+                    parts.append(f"поле {loc} длиннее {limit} символов")
+                else:
+                    parts.append(f"поле {loc} слишком длинное")
             elif err_type in _TYPE_ERRORS or err_type.endswith("_type"):
                 parts.append(f"поле {loc} имеет неверный тип")
             else:
@@ -108,11 +130,135 @@ def parse_json_object(raw: str) -> object:
     return json.loads(strip_json_fences(raw))
 
 
-def extract_meaning(client: LLMClient, text: str) -> MeaningExtract:
+def _length_only(exc: Exception) -> bool:
+    """True when every schema problem is a string that is too long."""
+    if isinstance(exc, ValidationError):
+        errors = exc.errors()
+        return bool(errors) and all(err["type"] == "string_too_long" for err in errors)
+    return isinstance(exc, ValueError) and "длиннее лимита маршрута" in str(exc)
+
+
+def _clip_text(value: object, limit: int) -> object:
+    if not isinstance(value, str):
+        return value
+    return value.strip()[:limit].rstrip()
+
+
+def clip_meaning(data: dict) -> dict:
+    """Shorten meaning fields down to the existing limits."""
+    clipped = dict(data)
+    clipped["meaning"] = _clip_text(clipped.get("meaning"), MAX_SUMMARY_CHARS)
+    points = clipped.get("key_points")
+    if isinstance(points, list):
+        clipped["key_points"] = [
+            _clip_text(item, MAX_KEY_POINT_CHARS) for item in points
+        ]
+    return clipped
+
+
+def clip_classification(data: dict) -> dict:
+    """Shorten intent down to the existing limit."""
+    clipped = dict(data)
+    clipped["intent"] = _clip_text(clipped.get("intent"), MAX_INTENT_CHARS)
+    return clipped
+
+
+def clip_final_answer(data: dict, limit: int) -> dict:
+    """Shorten the routed answer down to that route's limit."""
+    clipped = dict(data)
+    clipped["final_answer"] = _clip_text(clipped.get("final_answer"), limit)
+    return clipped
+
+
+def clip_self_check(data: dict) -> dict:
+    """Shorten check notes down to the existing limit."""
+    clipped = dict(data)
+    clipped["notes"] = _clip_text(clipped.get("notes"), MAX_CHECK_NOTES_CHARS)
+    return clipped
+
+
+def _validate_final_answer(data: object, limit: int) -> FinalAnswer:
+    answer = FinalAnswer.model_validate(data)
+    if len(answer.final_answer) > limit:
+        raise ValueError(f"поле final_answer: длиннее лимита маршрута {limit}")
+    return answer
+
+
+def _clipped_summary(summary: str, limit: int) -> str:
+    text = summary.strip()[:limit].rstrip()
+    if text:
+        return text
+    fallback = "Не удалось сформировать ответ."
+    return fallback[:limit]
+
+
+def _degraded_check(exc: Exception) -> SelfCheck:
+    notes = f"проверка не выполнена: {explain_failure(exc)}"
+    if len(notes) > MAX_CHECK_NOTES_CHARS:
+        notes = notes[:MAX_CHECK_NOTES_CHARS].rstrip()
+    return SelfCheck(consistent=False, details_kept=False, notes=notes)
+
+
+def request_model(
+    client: LLMClient,
+    *,
+    system: str,
+    user: str,
+    schema: str,
+    step: str,
+    warnings: list[str],
+    validate: Callable[[object], M],
+    clip: Callable[[dict], dict],
+) -> M:
+    """Call the model once, then one repair prompt. Clip only a still-too-long repair."""
+    raw = client.complete(system, user)
+    try:
+        return validate(parse_json_object(raw))
+    except (JSONDecodeError, ValidationError, ValueError) as exc:
+        reason = explain_failure(exc)
+        logger.warning("step=%s fallback reason=%s", step, reason)
+        warnings.append(f"fallback: {step}: {reason}")
+        repaired = client.complete(
+            FALLBACK_SYSTEM,
+            build_repair_user(schema, reason, raw),
+        )
+        try:
+            return validate(parse_json_object(repaired))
+        except (JSONDecodeError, ValidationError, ValueError) as repair_exc:
+            if not _length_only(repair_exc):
+                raise
+            try:
+                parsed = parse_json_object(repaired)
+            except JSONDecodeError:
+                raise repair_exc from None
+            if not isinstance(parsed, dict):
+                raise repair_exc
+            try:
+                value = validate(clip(parsed))
+            except (ValidationError, ValueError) as clip_exc:
+                raise repair_exc from clip_exc
+            logger.warning("step=%s truncated", step)
+            warnings.append(f"truncated: {step}")
+            return value
+
+
+def extract_meaning(
+    client: LLMClient,
+    text: str,
+    warnings: list[str],
+) -> MeaningExtract:
     """Step 1. Sees only the raw text."""
     logger.info("step=extract_meaning start chars=%s", len(text))
-    raw = client.complete(EXTRACT_SYSTEM, build_extract_user(text))
-    extracted = MeaningExtract.model_validate(parse_json_object(raw))
+    extracted = request_model(
+        client,
+        system=EXTRACT_SYSTEM,
+        user=build_extract_user(text),
+        schema=EXTRACT_SCHEMA,
+        step="extract_meaning",
+        warnings=warnings,
+        validate=MeaningExtract.model_validate,
+        clip=clip_meaning,
+    )
     logger.info(
         "step=extract_meaning done meaning_chars=%s points=%s",
         len(extracted.meaning),
@@ -126,14 +272,25 @@ def classify_request(
     text: str,
     extracted: MeaningExtract,
     variant: PromptVariant,
+    warnings: list[str],
 ) -> RequestClassification:
     """Step 2. Sees the extracted meaning and key points."""
     logger.info("step=classify start prompt=%s", variant.name)
-    raw = client.complete(
-        variant.system,
-        build_classify_user(text, extracted.meaning, extracted.key_points, variant),
+    classification = request_model(
+        client,
+        system=variant.system,
+        user=build_classify_user(
+            text,
+            extracted.meaning,
+            extracted.key_points,
+            variant,
+        ),
+        schema=CLASSIFY_SCHEMA,
+        step="classify",
+        warnings=warnings,
+        validate=RequestClassification.model_validate,
+        clip=clip_classification,
     )
-    classification = RequestClassification.model_validate(parse_json_object(raw))
     logger.info(
         "step=classify done category=%s sentiment=%s intent=%s",
         classification.category.value,
@@ -168,21 +325,43 @@ def generate_final_answer(
     client: LLMClient,
     text: str,
     fields: StructuredFields,
+    warnings: list[str],
 ) -> str:
     """Step 4. The route and the answer both come from the structured fields."""
     route = get_route(fields.category.value)
     logger.info("step=final_answer start route=%s", route.name)
-    raw = client.complete(
-        route.system,
-        build_answer_user(
-            text,
-            fields.summary,
-            fields.intent,
-            fields.key_points,
-            fields.category.value,
-        ),
-    )
-    answer = FinalAnswer.model_validate(parse_json_object(raw))
+    try:
+        answer = request_model(
+            client,
+            system=route.system,
+            user=build_answer_user(
+                text,
+                fields.summary,
+                fields.intent,
+                fields.key_points,
+                fields.category.value,
+            ),
+            schema=ANSWER_SCHEMA,
+            step="final_answer",
+            warnings=warnings,
+            validate=lambda data: _validate_final_answer(data, route.max_chars),
+            clip=lambda data: clip_final_answer(data, route.max_chars),
+        )
+    except (LLMClientError, ValidationError, ValueError) as exc:
+        message = explain_failure(exc)
+        logger.warning(
+            "step=final_answer degraded error=%s: %s",
+            type(exc).__name__,
+            message,
+        )
+        warnings.append(f"degraded: final_answer: {message}")
+        final_answer = _clipped_summary(fields.summary, route.max_chars)
+        logger.info(
+            "step=final_answer done route=%s chars=%s degraded=yes",
+            route.name,
+            len(final_answer),
+        )
+        return final_answer
     logger.info(
         "step=final_answer done route=%s chars=%s",
         route.name,
@@ -196,21 +375,37 @@ def self_check_result(
     text: str,
     fields: StructuredFields,
     final_answer: str,
+    warnings: list[str],
 ) -> SelfCheck:
     """Step 5. Checks the answer against the original text and earlier fields."""
     logger.info("step=self_check start")
-    raw = client.complete(
-        SELF_CHECK_SYSTEM,
-        build_self_check_user(
-            text,
-            fields.summary,
-            fields.key_points,
-            fields.category.value,
-            fields.intent,
-            final_answer,
-        ),
-    )
-    check = SelfCheck.model_validate(parse_json_object(raw))
+    try:
+        check = request_model(
+            client,
+            system=SELF_CHECK_SYSTEM,
+            user=build_self_check_user(
+                text,
+                fields.summary,
+                fields.key_points,
+                fields.category.value,
+                fields.intent,
+                final_answer,
+            ),
+            schema=SELF_CHECK_SCHEMA,
+            step="self_check",
+            warnings=warnings,
+            validate=SelfCheck.model_validate,
+            clip=clip_self_check,
+        )
+    except (LLMClientError, ValidationError, ValueError) as exc:
+        message = explain_failure(exc)
+        logger.warning(
+            "step=self_check degraded error=%s: %s",
+            type(exc).__name__,
+            message,
+        )
+        warnings.append(f"degraded: self_check: {message}")
+        check = _degraded_check(exc)
     logger.info(
         "step=self_check done consistent=%s details_kept=%s",
         check.consistent,
@@ -226,12 +421,13 @@ def process_text(
 ) -> TextProcessingResult:
     """Run extract, classify, structured fields, routed answer, and self-check."""
     selected = variant or get_variant()
+    warnings: list[str] = []
     logger.info("chain start length=%s prompt=%s", len(text), selected.name)
-    extracted = extract_meaning(client, text)
-    classification = classify_request(client, text, extracted, selected)
+    extracted = extract_meaning(client, text, warnings)
+    classification = classify_request(client, text, extracted, selected, warnings)
     fields = build_structured_fields(extracted, classification)
-    final_answer = generate_final_answer(client, text, fields)
-    check = self_check_result(client, text, fields, final_answer)
+    final_answer = generate_final_answer(client, text, fields, warnings)
+    check = self_check_result(client, text, fields, final_answer, warnings)
     result = TextProcessingResult(
         summary=fields.summary,
         key_points=fields.key_points,
@@ -242,13 +438,15 @@ def process_text(
         consistent=check.consistent,
         details_kept=check.details_kept,
         check_notes=check.notes,
+        warnings=warnings,
     )
     logger.info(
-        "chain done category=%s route=%s consistent=%s details_kept=%s",
+        "chain done category=%s route=%s consistent=%s details_kept=%s warnings=%s",
         result.category.value,
         result.category.value,
         result.consistent,
         result.details_kept,
+        len(result.warnings),
     )
     return result
 
@@ -271,6 +469,9 @@ def load_examples(path: Path) -> list[dict[str, str]]:
         expected = str(item.get("expected_category") or "").strip()
         if expected:
             example["expected_category"] = expected
+        scenario = str(item.get("scenario") or "").strip()
+        if scenario:
+            example["scenario"] = scenario
         examples.append(example)
     return examples
 
@@ -292,6 +493,8 @@ def run_items(
 
     for item in items:
         record = {"id": item["id"], "text": item["text"], "prompt": selected.name}
+        if item.get("scenario"):
+            record["scenario"] = item["scenario"]
         if item.get("expected_category"):
             record["expected_category"] = item["expected_category"]
         try:
@@ -321,7 +524,11 @@ def print_results(results: list[dict]) -> None:
     """Print a readable block for each processed text."""
     for record in results:
         prompt_name = record.get("prompt", DEFAULT_VARIANT_NAME)
-        print(f"=== {record['id']} ({prompt_name}) ===")
+        scenario = record.get("scenario")
+        if scenario:
+            print(f"=== {record['id']}: {scenario} ({prompt_name}) ===")
+        else:
+            print(f"=== {record['id']} ({prompt_name}) ===")
         print(record["text"])
         print()
         if "error" in record:
@@ -344,6 +551,8 @@ def print_results(results: list[dict]) -> None:
                 f"details_kept={record['details_kept']} "
                 f"notes={record['check_notes']}"
             )
+            if record.get("warnings"):
+                print("Предупреждения: " + "; ".join(record["warnings"]))
             print(record["delivery"])
         print()
 
@@ -358,7 +567,7 @@ def save_results(path: Path, results: list[dict]) -> None:
 
 
 def report_categories(results: list[dict]) -> int:
-    """Print how many predicted categories match the examples. Return 1 below 8 matches."""
+    """Print category accuracy. The 10-example set fails the run below 8 matches."""
     expected = [record for record in results if record.get("expected_category")]
     if not expected:
         return 0
@@ -374,14 +583,22 @@ def report_categories(results: list[dict]) -> int:
             print(
                 f"- {record['id']}: ожидали {record['expected_category']}, получили {got}"
             )
+    if len(expected) < 10:
+        return 0
     return 1 if len(matched) < 8 else 0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Сжать текст в summary, три ключевые мысли и короткий ответ.",
+        description="Разобрать текст: смысл, категория, ответ по маршруту и проверка.",
     )
     parser.add_argument("--text", help="Обработать один произвольный текст.")
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=EXAMPLES_PATH,
+        help=f"JSON со списком примеров (по умолчанию {EXAMPLES_PATH}).",
+    )
     parser.add_argument(
         "--prompt",
         choices=tuple(VARIANTS),
@@ -417,7 +634,7 @@ def main() -> int:
             return 1
     else:
         try:
-            items = load_examples(EXAMPLES_PATH)
+            items = load_examples(args.input)
         except (OSError, JSONDecodeError, ValueError) as exc:
             logger.error("examples failed error=%s: %s", type(exc).__name__, exc)
             return 1

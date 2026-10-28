@@ -1,30 +1,48 @@
 """Structured result of the text processing step."""
 
+from enum import Enum
 from typing import Annotated
 
 from pydantic import BaseModel, Field, field_validator
 
 from prompts import (
     KEY_POINT_COUNT,
+    MAX_FINAL_ANSWER_CHARS,
     MAX_KEY_POINT_CHARS,
-    MAX_RESPONSE_CHARS,
     MAX_SUMMARY_CHARS,
 )
+
+
+class Category(str, Enum):
+    question = "question"
+    information = "information"
+    advice = "advice"
+    bug = "bug"
+    other = "other"
+
+
+class Sentiment(str, Enum):
+    positive = "positive"
+    neutral = "neutral"
+    negative = "negative"
+
 
 KeyPoint = Annotated[str, Field(min_length=1, max_length=MAX_KEY_POINT_CHARS)]
 
 
 class TextProcessingResult(BaseModel):
-    """Summary, three key points, and a short helpful response."""
+    """Structured reading of one user text."""
 
     summary: str = Field(min_length=1, max_length=MAX_SUMMARY_CHARS)
+    category: Category
+    sentiment: Sentiment
     key_points: list[KeyPoint] = Field(
         min_length=KEY_POINT_COUNT,
         max_length=KEY_POINT_COUNT,
     )
-    response: str = Field(min_length=1, max_length=MAX_RESPONSE_CHARS)
+    final_answer: str = Field(min_length=1, max_length=MAX_FINAL_ANSWER_CHARS)
 
-    @field_validator("summary", "response", mode="before")
+    @field_validator("summary", "final_answer", mode="before")
     @classmethod
     def strip_required_text(cls, value: object) -> object:
         if not isinstance(value, str):
@@ -33,6 +51,13 @@ class TextProcessingResult(BaseModel):
         if not cleaned:
             raise ValueError("must not be blank")
         return cleaned
+
+    @field_validator("category", "sentiment", mode="before")
+    @classmethod
+    def strip_label(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
 
     @field_validator("key_points", mode="before")
     @classmethod

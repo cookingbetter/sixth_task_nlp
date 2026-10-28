@@ -10,7 +10,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from llm_client import LLMClient, LLMClientError
-from main import EXAMPLES_PATH, load_examples, process_text, save_results
+from main import EXAMPLES_PATH, explain_failure, load_examples, process_text, save_results
 from prompts import VARIANTS, get_variant
 
 DEFAULT_OUTPUT = Path("output/prompt_comparison.json")
@@ -28,21 +28,22 @@ def compare_prompts(client: LLMClient, items: list[dict[str, str]]) -> list[dict
             try:
                 result = process_text(client, item["text"], variant)
             except (LLMClientError, ValidationError, ValueError) as exc:
+                message = explain_failure(exc)
                 logger.error(
                     "text failed id=%s prompt=%s error=%s: %s",
                     item["id"],
                     name,
                     type(exc).__name__,
-                    exc,
+                    message,
                 )
                 record["ok"] = False
-                record["error"] = str(exc)
+                record["error"] = message
             else:
-                dumped = result.model_dump()
+                dumped = result.model_dump(mode="json")
                 record["ok"] = True
                 record["summary_chars"] = len(dumped["summary"])
                 record["key_point_chars"] = [len(point) for point in dumped["key_points"]]
-                record["response_chars"] = len(dumped["response"])
+                record["final_answer_chars"] = len(dumped["final_answer"])
                 record.update(dumped)
             records.append(record)
     return records
@@ -58,7 +59,7 @@ def print_comparison(records: list[dict]) -> None:
                 f"{label} ok "
                 f"summary={record['summary_chars']} "
                 f"points={points} "
-                f"response={record['response_chars']}"
+                f"final_answer={record['final_answer_chars']}"
             )
         else:
             print(f"{label} error {record['error']}")

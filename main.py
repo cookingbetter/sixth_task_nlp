@@ -12,12 +12,60 @@ from pydantic import ValidationError
 
 from llm_client import LLMClient, LLMClientError
 from prompts import DEFAULT_VARIANT_NAME, VARIANTS, PromptVariant, get_variant
-from schemas import TextProcessingResult
+from schemas import Category, Sentiment, TextProcessingResult
 
 EXAMPLES_PATH = Path("examples/sample_inputs.json")
 DEFAULT_OUTPUT = Path("output/results.json")
 
 logger = logging.getLogger("pipeline")
+
+CATEGORY_LABELS = {
+    Category.question: "Ответ на вопрос",
+    Category.information: "Краткий итог",
+    Category.advice: "Рекомендация",
+    Category.bug: "Что сделать с ошибкой",
+    Category.other: "Итог",
+}
+SENTIMENT_PREFIX = {
+    Sentiment.negative: "Сначала разберите проблему. ",
+    Sentiment.positive: "Можно опереться на удачную часть. ",
+    Sentiment.neutral: "",
+}
+_TYPE_ERRORS = {
+    "enum",
+    "literal_error",
+    "is_instance_of",
+    "model_type",
+}
+
+
+def build_delivery(result: TextProcessingResult) -> str:
+    """Build the user-facing answer from category, sentiment, and final_answer."""
+    label = CATEGORY_LABELS[result.category]
+    prefix = SENTIMENT_PREFIX[result.sentiment]
+    return f"{label}: {prefix}{result.final_answer}"
+
+
+def explain_failure(exc: Exception) -> str:
+    """Turn a parse or schema error into one short message."""
+    if isinstance(exc, ValidationError):
+        parts: list[str] = []
+        for err in exc.errors():
+            loc = ".".join(str(part) for part in err["loc"]) or "ответ"
+            err_type = err["type"]
+            if err_type == "missing":
+                parts.append(f"нет поля {loc}")
+            elif err_type in _TYPE_ERRORS or err_type.endswith("_type"):
+                parts.append(f"поле {loc} имеет неверный тип")
+            else:
+                parts.append(f"поле {loc}: {err['msg']}")
+        return "Ответ не прошёл схему: " + "; ".join(parts)
+    if isinstance(exc, JSONDecodeError):
+        return (
+            f"Невалидный JSON: {exc.msg} "
+            f"(строка {exc.lineno}, символ {exc.colno})"
+        )
+    return str(exc)
 
 
 def strip_json_fences(raw: str) -> str:
@@ -34,6 +82,18 @@ def strip_json_fences(raw: str) -> str:
     return "\n".join(lines).strip()
 
 
+def parse_model_payload(raw: str) -> TextProcessingResult:
+    """Parse model text and validate it against the result schema."""
+    payload = json.loads(strip_json_fences(raw))
+    result = TextProcessingResult.model_validate(payload)
+    logger.info(
+        "validation ok category=%s sentiment=%s",
+        result.category.value,
+        result.sentiment.value,
+    )
+    return result
+
+
 def process_text(
     client: LLMClient,
     text: str,
@@ -44,15 +104,7 @@ def process_text(
     logger.info("processing text length=%s prompt=%s", len(text), selected.name)
     raw = client.complete(selected.system, selected.build_user(text))
     logger.info("model response received chars=%s", len(raw))
-
-    try:
-        payload = json.loads(strip_json_fences(raw))
-    except JSONDecodeError as exc:
-        raise ValueError(f"Model returned invalid JSON: {exc.msg}") from exc
-
-    result = TextProcessingResult.model_validate(payload)
-    logger.info("validation ok")
-    return result
+    return parse_model_payload(raw)
 
 
 def load_examples(path: Path) -> list[dict[str, str]]:
@@ -93,16 +145,18 @@ def run_items(
         try:
             result = process_text(client, item["text"], selected)
         except (LLMClientError, ValidationError, ValueError) as exc:
+            message = explain_failure(exc)
             logger.error(
                 "text failed id=%s prompt=%s error=%s: %s",
                 item["id"],
                 selected.name,
                 type(exc).__name__,
-                exc,
+                message,
             )
-            record["error"] = str(exc)
+            record["error"] = message
         else:
-            record.update(result.model_dump())
+            record.update(result.model_dump(mode="json"))
+            record["delivery"] = build_delivery(result)
         results.append(record)
 
     failed = sum(1 for record in results if "error" in record)
@@ -121,10 +175,12 @@ def print_results(results: list[dict]) -> None:
             print(f"Ошибка: {record['error']}")
         else:
             print(f"Summary: {record['summary']}")
+            print(f"Категория: {record['category']}")
+            print(f"Тональность: {record['sentiment']}")
             print("Ключевые мысли:")
             for index, point in enumerate(record["key_points"], start=1):
                 print(f"{index}. {point}")
-            print(f"Ответ: {record['response']}")
+            print(record["delivery"])
         print()
 
 
